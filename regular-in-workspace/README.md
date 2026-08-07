@@ -13,7 +13,7 @@ For **air-gapped** compute (no cluster internet), use the sibling
 |---|---|---|---|
 | `lakebridge_analyzer.py`  | Assessment / Analyzer | Serverless or classic | ✅ Verified end-to-end (AWS + Azure) |
 | `lakebridge_reconcile.py` | Reconciler            | **Classic cluster** (not serverless) | ✅ Verified end-to-end (D2D) |
-| `lakebridge_transpile.py` | Transpiler            | Classic (Morpheus needs Java 21) or Switch job | ⚠️ Scaffold — validate before use |
+| `lakebridge_transpile.py` | Transpiler (sqlglot engine) | Serverless or classic | ✅ Verified end-to-end (Azure); SQL-only — PL/SQL → Morpheus/Switch |
 
 Each notebook has a **CONFIG cell** at the top; edit it and Run All.
 
@@ -32,9 +32,12 @@ Each notebook has a **CONFIG cell** at the top; edit it and Run All.
    persist step (`PERSIST TABLE not supported on serverless`). Pre-create the metadata
    schema (`<catalog>.lb_recon`) and a UC Volume (`reconcile_volume`) — the bits
    `configure-reconcile` normally makes.
-4. **Transpiler engine choice:** Morpheus (deterministic, needs **Java 21** on compute) vs
-   **Switch** (LLM job, token-metered, no JDK). The productized **agentic converter**
-   (`/migrate`) is recommended going forward.
+4. **Transpiler uses the pure-Python `sqlglot` engine** — no `install-transpile`, no Java.
+   Wrap the async engine call with `nest_asyncio` (notebooks already run an event loop, so
+   a bare `asyncio.run()` raises `cannot be called from a running event loop`). sqlglot is
+   SQL-only; for PL/SQL procedural code use **Morpheus** (needs Java 21) or **Switch** (LLM
+   job, token-metered). The productized **agentic converter** (`/migrate`) is recommended
+   going forward.
 
 ## Reconciler notes
 

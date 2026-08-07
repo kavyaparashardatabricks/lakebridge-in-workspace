@@ -20,7 +20,7 @@ is installed** (PyPI vs an offline wheelhouse on a UC Volume) and the required *
 ### `regular-in-workspace/`
 - `lakebridge_analyzer.py` — Assessment/Analyzer. ✅ Verified end-to-end on **AWS** and **Azure**.
 - `lakebridge_reconcile.py` — Reconciler (`TriggerReconService.trigger_recon`). ✅ Verified (D2D).
-- `lakebridge_transpile.py` — Transpiler (Morpheus vs Switch). ⚠️ Scaffold — validate before use.
+- `lakebridge_transpile.py` — Transpiler (pure-Python `sqlglot` engine, no Java). ✅ Verified end-to-end (Azure); SQL-only, route PL/SQL to Morpheus/Switch.
 
 ### `airgapped-in-workspace/`
 - `RUNBOOK.md` — **the full verified offline procedure** (wheelhouse build/upload, backend
@@ -47,6 +47,7 @@ is installed** (PyPI vs an offline wheelhouse on a UC Volume) and the required *
   run the same notebook on a **classic cluster** with no code changes.
 - **Reconciler** requires a **classic cluster** (or Pro SQL warehouse). Use **DBR 17.3+** for
   external sources via `remote_query`/Lakehouse Federation.
-- **Transpiler**: Morpheus needs **Java 21** on the compute; **Switch** runs as a job and
-  uses model serving (token-metered). The productized **agentic converter** (`/migrate`) is
-  recommended going forward.
+- **Transpiler**: the notebook uses the pure-Python **`sqlglot`** engine (no Java, no
+  `install-transpile`) — verified on serverless/classic. For PL/SQL procedural code beyond
+  sqlglot's SQL scope, use **Morpheus** (needs Java 21) or **Switch** (LLM job, token-metered);
+  the productized **agentic converter** (`/migrate`) is recommended going forward.

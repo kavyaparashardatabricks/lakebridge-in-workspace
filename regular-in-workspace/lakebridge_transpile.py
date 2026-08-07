@@ -1,75 +1,88 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Lakebridge Transpiler — in-workspace run (no CLI, no `install-transpile`)
+# MAGIC # Lakebridge Transpiler — in-workspace run (no CLI, no `install-transpile`, no Java)
 # MAGIC
-# MAGIC Converts source SQL/ETL to Databricks SQL from inside a workspace notebook. Lakebridge
-# MAGIC ships **two** transpiler engines — pick per your source and constraints:
+# MAGIC Converts source SQL to Databricks SQL from inside a workspace notebook using
+# MAGIC Lakebridge's **pure-Python `sqlglot` engine** — no `databricks labs lakebridge
+# MAGIC install-transpile`, no downloaded LSP transpiler servers, and **no Java 21**.
+# MAGIC Runs on serverless or classic compute.
 # MAGIC
-# MAGIC | Engine | What it is | In-workspace fit | Notes |
-# MAGIC |---|---|---|---|
-# MAGIC | **Morpheus** | Deterministic grammar-based transpiler (`databricks-bb-*`) | Needs **Java 21** on the compute | Best for supported SQL dialects; JDK is hard on serverless — use a classic cluster with Java, or run locally |
-# MAGIC | **Switch** | LLM/agent-based transpiler that runs **as a Databricks job** | Native in-workspace | Uses model serving (token cost); handles dialects Morpheus doesn't; newer `/migrate` agentic converter is the productized successor |
+# MAGIC Lakebridge ships three transpiler engines; this notebook uses the first:
 # MAGIC
-# MAGIC > ⚠️ **Verification status:** the Analyzer and Reconciler notebooks in this folder are
-# MAGIC > verified end-to-end. This transpiler notebook is a **starting scaffold** — the
-# MAGIC > engine call below follows the package API but has not been run end-to-end in a
-# MAGIC > notebook here. Validate on a small batch first. For most in-workspace, no-CLI use
-# MAGIC > cases the **Switch job** or the productized **agentic converter** (`/migrate`,
-# MAGIC > https://docs.databricks.com/aws/en/migration/lakebridge-agentic-converter) is the
-# MAGIC > smoother path.
+# MAGIC | Engine | What it is | In-workspace fit |
+# MAGIC |---|---|---|
+# MAGIC | **sqlglot** (used here) | Pure-Python dialect translator | ✅ Runs directly in a notebook, no Java, no extra install |
+# MAGIC | **Morpheus** | Deterministic grammar-based LSP transpiler | Needs `install-transpile` + **Java 21** on the compute |
+# MAGIC | **Switch** | LLM/agent transpiler that runs as a Databricks job | Token-metered (model serving); newer `/migrate` agentic converter is the productized successor |
+# MAGIC
+# MAGIC sqlglot handles the common SQL-dialect surface; for constructs it can't translate it
+# MAGIC records a per-file error (see `error_count` in the output) — those are the pieces to
+# MAGIC route to Morpheus/Switch or fix by hand.
+# MAGIC
+# MAGIC > ✅ **Verified end-to-end** on a Databricks classic cluster (Azure, DBR 16.4):
+# MAGIC > 4 Oracle files transpiled and written to a UC Volume. sqlglot translates SQL
+# MAGIC > constructs well (`NVL`→`COALESCE`, `SYSDATE`→`CURRENT_TIMESTAMP()`, INSERT
+# MAGIC > reformatting). It is a **SQL** transpiler, so PL/SQL procedural wrappers
+# MAGIC > (`CREATE FUNCTION … IS BEGIN … END`, `DBMS_OUTPUT`, cursors) are only partially
+# MAGIC > handled — route those files to **Morpheus** or **Switch**. Check `error_count`
+# MAGIC > per file to see what needs follow-up.
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-labs-lakebridge
+# MAGIC %pip install databricks-labs-lakebridge nest_asyncio
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
 
 # DBTITLE 1,CONFIG — edit these
-SOURCE_DIR    = "/Volumes/<catalog>/<schema>/<volume>/input"    # source SQL/ETL files
-OUTPUT_DIR    = "/Volumes/<catalog>/<schema>/<volume>/transpiled"
-SOURCE_DIALECT = "oracle"      # e.g. oracle, snowflake, tsql, teradata, ...
-# Morpheus needs Java 21 available on the driver; check before running (see cell below).
+SOURCE_DIR     = "/Volumes/<catalog>/<schema>/<volume>/input"        # source .sql files
+OUTPUT_DIR     = "/Volumes/<catalog>/<schema>/<volume>/transpiled"   # transpiled output
+SOURCE_DIALECT = "oracle"       # must be in SqlglotEngine().supported_dialects
+TARGET_DIALECT = "databricks"
 
 # COMMAND ----------
 
-# DBTITLE 1,Morpheus path — direct engine call
-# The transpiler config + engine live under databricks.labs.lakebridge.transpiler.
-# This mirrors what `databricks labs lakebridge transpile` drives internally.
-import shutil, subprocess, tempfile
+# DBTITLE 1,Transpile every .sql file with the sqlglot engine
+import asyncio, shutil, tempfile
+import nest_asyncio; nest_asyncio.apply()   # notebooks already run an event loop, so
+                                            # asyncio.run() would raise; patch to allow it
 from pathlib import Path
+from databricks.labs.lakebridge.transpiler.sqlglot.sqlglot_engine import SqlglotEngine
 
-# 1) Confirm Java 21 is present (Morpheus requirement). If this fails, use Switch instead.
-print(subprocess.run(["java", "-version"], capture_output=True, text=True).stderr or "no java")
+engine = SqlglotEngine()
+print("engine:", engine.transpiler_name)
+assert SOURCE_DIALECT in engine.supported_dialects, \
+    f"{SOURCE_DIALECT!r} not supported; pick from {engine.supported_dialects}"
+assert TARGET_DIALECT in engine.supported_dialects
 
-from databricks.labs.lakebridge.config import TranspileConfig
-from databricks.labs.lakebridge.transpiler.execute import transpile as run_transpile  # engine entrypoint
-from databricks.sdk import WorkspaceClient
+src = Path(SOURCE_DIR)
+vol_out = Path(OUTPUT_DIR); vol_out.mkdir(parents=True, exist_ok=True)
+local_out = Path(tempfile.mkdtemp(prefix="lb_transpile_"))   # seekable local scratch
 
-out = Path(OUTPUT_DIR); out.mkdir(parents=True, exist_ok=True)
-cfg = TranspileConfig(
-    transpiler_config_path=None,        # default Morpheus config
-    source_dialect=SOURCE_DIALECT,
-    input_source=SOURCE_DIR,
-    output_folder=OUTPUT_DIR,
-    skip_validation=True,               # set False to validate against a target
-    catalog_name=None, schema_name=None,
-)
-# NOTE: exact transpile() signature can vary by Lakebridge version — inspect with
-#   help(run_transpile)
-# and adjust. Prefer Switch (next cell) if Java 21 isn't available on this compute.
-result = run_transpile(WorkspaceClient(), cfg)   # may be async in some versions
-print("transpile result:", result)
-print("outputs:", [p.name for p in out.iterdir()][:20])
+sql_files = list(src.rglob("*.sql"))
+assert sql_files, f"no .sql files under {src}"
+
+async def run():
+    rows = []
+    for f in sql_files:
+        res = await engine.transpile(SOURCE_DIALECT, TARGET_DIALECT, f.read_text(), f)
+        out_name = f.stem + ".databricks.sql"
+        (local_out / out_name).write_text(res.transpiled_code)   # write local first
+        shutil.copy(local_out / out_name, vol_out / out_name)    # then copy to Volume
+        rows.append((f.name, res.success_count, len(res.error_list)))
+        for err in res.error_list:
+            print(f"  [warn] {f.name}: {err}")
+    return rows
+
+rows = asyncio.get_event_loop().run_until_complete(run())
+print("\ntranspiled (file, success_count, error_count):")
+for r in rows:
+    print("  ", r)
+print("\noutput dir:", [p.name for p in vol_out.iterdir()])
 
 # COMMAND ----------
 
-# DBTITLE 1,Switch path (LLM transpiler as a workspace job) — pointer
-# MAGIC %md
-# MAGIC Switch runs as a Databricks **job** and uses model serving (token-metered). It is the
-# MAGIC no-CLI, no-JDK in-workspace option and handles dialects Morpheus can't. To use it:
-# MAGIC install/import the Switch assets into the workspace and trigger the job with your
-# MAGIC source/target volumes as parameters. The newer **agentic converter** (`/migrate`) is
-# MAGIC the productized version and is recommended going forward. Token consumption is the
-# MAGIC main cost driver — as a rough field data point, ~350 SQL files transpiled with Switch
-# MAGIC consumed on the order of 5–8M tokens/day for the running user.
+# DBTITLE 1,Show one transpiled sample
+sample = sorted(vol_out.glob("*.databricks.sql"))[0]
+print("===", sample.name, "===")
+print(sample.read_text())
