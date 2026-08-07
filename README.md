@@ -1,79 +1,52 @@
-# Lakebridge Analyzer — in workspace
+# Lakebridge in workspace
 
-Run the [Databricks Lakebridge](https://databrickslabs.github.io/lakebridge/) **Assessment / Analyzer**
-directly inside a Databricks workspace, from a **serverless Python notebook** — no
-Databricks CLI and no desktop app required.
+Run the [Databricks Lakebridge](https://databrickslabs.github.io/lakebridge/) migration
+tools — **Analyzer** (assessment), **Transpiler**, and **Reconciler** — directly inside a
+Databricks workspace notebook. **No Databricks CLI** (`labs install` /
+`configure-reconcile`), **no desktop app** — everything runs as notebooks/jobs in the
+workspace by calling the Lakebridge engine classes directly.
 
-The Analyzer scans exported source-system metadata (SQL files, or ETL repo exports such
-as Informatica / SSIS / DataStage XML/JSON), scores job/query complexity, inventories
-objects, and maps interdependencies. It produces an Excel report (`.xlsx`) and,
-optionally, a JSON report.
+## Which folder do I use?
 
-## What's here
+| Your compute | Folder |
+|---|---|
+| Has outbound internet (`%pip install` reaches PyPI) | **[`regular-in-workspace/`](./regular-in-workspace)** |
+| Air-gapped — no internet on the cluster | **[`airgapped-in-workspace/`](./airgapped-in-workspace)** |
 
-- **`lakebridge analyzer in workspace.py`** — a Databricks notebook (source format) that
-  installs Lakebridge, runs the Analyzer against a folder of source files staged on a
-  Unity Catalog Volume, and writes the report back to a Volume.
+The two folders share the same engine-call approach; they differ only in **how Lakebridge
+is installed** (PyPI vs an offline wheelhouse on a UC Volume) and the required **compute**
+(serverless is fine for the Analyzer; the Reconciler needs a classic cluster).
 
-## Prerequisites
+### `regular-in-workspace/`
+- `lakebridge_analyzer.py` — Assessment/Analyzer. ✅ Verified end-to-end on **AWS** and **Azure**.
+- `lakebridge_reconcile.py` — Reconciler (`TriggerReconService.trigger_recon`). ✅ Verified (D2D).
+- `lakebridge_transpile.py` — Transpiler (Morpheus vs Switch). ⚠️ Scaffold — validate before use.
 
-- A Databricks workspace with **serverless** notebook compute.
-- A **Unity Catalog Volume** to hold the input source files and the output report.
-- Exported source metadata staged in the input Volume folder (e.g. Oracle `.sql` files).
+### `airgapped-in-workspace/`
+- `RUNBOOK.md` — **the full verified offline procedure** (wheelhouse build/upload, backend
+  pre-create, Analyzer + Reconciler, external Redshift source, gotchas). Start here.
+- `lakebridge_analyzer_offline.py`, `lakebridge_reconcile_offline.py` — offline-install
+  companions to the runbook.
 
-## Usage
+## The three things that make in-workspace runs work
 
-1. Import the notebook into your workspace:
-   - **UI:** Workspace → Import → select `lakebridge analyzer in workspace.py`, or
-   - **CLI:**
-     ```bash
-     databricks workspace import "/Users/<you>/lakebridge analyzer in workspace" \
-       --file "lakebridge analyzer in workspace.py" \
-       --language PYTHON --format SOURCE
-     ```
-2. Attach the notebook to **Serverless** compute.
-3. Edit the **CONFIG** cell:
-   - `SOURCE_DIR`  — Volume folder of source files, e.g. `/Volumes/<catalog>/<schema>/<volume>/input`
-   - `OUTPUT_DIR`  — Volume folder for the report, e.g. `/Volumes/<catalog>/<schema>/<volume>/output`
-   - `PLATFORM`    — source technology (must match `Analyzer.supported_source_technologies()`,
-                     printed at runtime), e.g. `"Oracle"`, `"Snowflake"`, `"Teradata"`, `"SSIS"`, …
-   - `GENERATE_JSON` — `True` to also emit `report.json`
-4. **Run All.** The report lands at `OUTPUT_DIR/report.xlsx` (and `report.json`).
+1. **Call the engine directly, not `ApplicationContext`** — importing the CLI's application
+   context fails in a notebook (`NotADirectoryError: Cannot find project root`). Use
+   `Analyzer.analyze(...)` and `TriggerReconService.trigger_recon(...)`.
+2. **Analyzer report: write to local scratch, then copy to the Volume** — a direct `.xlsx`
+   write to a UC Volume (FUSE) truncates to a ~390-byte corrupt stub. Use
+   `tempfile.mkdtemp()` (`/local_disk0` is read-only on serverless), then `shutil.copy`.
+3. **Reconciler: classic cluster + pre-created backend** — serverless can't run the persist
+   step (`PERSIST TABLE not supported on serverless`); pre-create the metadata schema
+   (`lb_recon`) and a UC Volume (`reconcile_volume`).
 
-## Why it's built this way (serverless gotchas)
+## Compute notes
 
-These three points are the difference between a working run and a silent failure:
-
-1. **Call the `bladespector` engine directly — not `ApplicationContext`.**
-   Importing `databricks.labs.lakebridge.contexts.application` triggers blueprint's
-   `find_project_root()`, which fails in a notebook (`NotADirectoryError: Cannot find
-   project root`) because the package lives in `site-packages` with no project marker.
-   That context object only exists to wire up interactive CLI prompts. The notebook calls
-   `Analyzer.analyze(source_dir, results_file_path, platform, is_debug, json_result)`
-   instead.
-
-2. **Write the report to local scratch first, then copy to the Volume.**
-   Unity Catalog Volumes are a FUSE mount that can't do the random-access seeks the
-   `.xlsx` (zip) writer needs. Writing straight to a Volume truncates the file to a
-   ~390-byte corrupt stub. The notebook writes to local scratch and then `shutil.copy`s
-   the finished files to the Volume.
-
-3. **Use `tempfile.mkdtemp()` for scratch, not `/local_disk0`.**
-   `/local_disk0` is read-only on serverless compute. `tempfile.mkdtemp()` writes under
-   `/tmp`, which is writable.
-
-Also: `openpyxl` isn't preinstalled on serverless, so it's added to the `%pip install`
-line for the workbook-inspection cell.
-
-## Report contents
-
-The generated workbook contains worksheets such as: **Summary**, **SQL Programs**
-(per-script complexity), **SQL Script Categories**, **Functions** / **Functions by
-Script**, **Referenced Objects**, **Program-Object Xref**, **Loops & Cursors**,
-**Conditionals**, and **SQL Data Types**.
-
-## Verified
-
-Confirmed working end-to-end on serverless notebook compute against 125 Oracle `.sql`
-files, producing a ~58 KB `report.xlsx` (14 worksheets) and a ~116 KB `report.json`.
-bladespector engine v5.6.6. No JDK was required (the Analyzer path is pure Python).
+- **Analyzer** runs on serverless or classic. On some workspaces serverless job runs hit a
+  transient `Futures timed out after [80 seconds]` kernel-startup error — if that happens,
+  run the same notebook on a **classic cluster** with no code changes.
+- **Reconciler** requires a **classic cluster** (or Pro SQL warehouse). Use **DBR 17.3+** for
+  external sources via `remote_query`/Lakehouse Federation.
+- **Transpiler**: Morpheus needs **Java 21** on the compute; **Switch** runs as a job and
+  uses model serving (token-metered). The productized **agentic converter** (`/migrate`) is
+  recommended going forward.
