@@ -23,10 +23,12 @@ is installed** (PyPI vs an offline wheelhouse on a UC Volume) and the required *
 - `lakebridge_transpile.py` — Transpiler (pure-Python `sqlglot` engine, no Java). ✅ Verified end-to-end (Azure); SQL-only, route PL/SQL to Morpheus/Switch.
 
 ### `airgapped-in-workspace/`
-- `RUNBOOK.md` — **the full verified offline procedure** (wheelhouse build/upload, backend
-  pre-create, Analyzer + Reconciler, external Redshift source, gotchas). Start here.
-- `lakebridge_analyzer_offline.py`, `lakebridge_reconcile_offline.py` — offline-install
-  companions to the runbook.
+- `RUNBOOK.md` — **a plain, step-by-step offline walkthrough** (download the package, upload to a
+  UC volume, then run each tool). Covers all four tools + connecting to an external database. Start here.
+- `lakebridge_analyzer_offline.py`, `lakebridge_transpile_offline.py`,
+  `lakebridge_reconcile_offline.py`, `lakebridge_profiler_offline.py` — offline-install notebooks.
+- ✅ Verified end-to-end on **Lakebridge 0.15.0**, DBR 17.3, in an air-gapped workspace — Analyzer,
+  Transpiler, Reconciler, and Profiler (against a private Redshift) all pass.
 
 ## The three things that make in-workspace runs work
 

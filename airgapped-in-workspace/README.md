@@ -1,48 +1,38 @@
-# Air-gapped in-workspace run (no cluster internet)
+# Air-gapped in-workspace run (no internet on the cluster)
 
-Run the Lakebridge **Analyzer** and **Reconciler** entirely inside a Databricks workspace
-notebook on a workspace whose **compute has no outbound internet** — no Databricks CLI
-(`labs install` / `configure-reconcile`), no desktop app.
+Run all four Lakebridge tools inside a Databricks workspace whose clusters **have no internet** —
+no Databricks CLI install, no desktop app. Everything is a notebook you import and run.
 
-The difference from [`../regular-in-workspace`](../regular-in-workspace) is **how the
-package is installed**: instead of `%pip install databricks-labs-lakebridge` (which fails
-with `[Errno 101] Network is unreachable`), you build a **wheelhouse** on a connected host,
-upload it to a **UC Volume**, and install offline with
-`%pip install --no-index --find-links=/Volumes/.../wheels ...`.
+The only difference from the [`../regular-in-workspace`](../regular-in-workspace) folder is **how
+Lakebridge gets installed**: the cluster can't reach PyPI, so you download the package once on a
+laptop, copy it to a Unity Catalog volume, and install it from there.
 
-## Start here: `RUNBOOK.md`
+## 👉 Start with [`RUNBOOK.md`](./RUNBOOK.md)
 
-**[`RUNBOOK.md`](./RUNBOOK.md)** is the full, verified end-to-end procedure. It covers:
+It's a plain, step-by-step walkthrough — from downloading the package to running each tool. Follow
+it top to bottom the first time.
 
-- **§3–4** Build the wheelhouse (match the *cluster's* Python/OS — e.g. DBR 17.3 ⇒ cp312 /
-  manylinux x86_64) and upload it to a UC Volume. Watch for missing transitive wheels
-  (e.g. `greenlet`); the Analyzer engine ships in the `databricks_bb_analyzer` wheel.
-- **§5** Pre-create the reconcile backend (metadata schema + `reconcile_volume`) — the bits
-  `configure-reconcile` normally makes.
-- **§6** Analyzer, offline. **§7** Reconciler, offline (Databricks-to-Databricks).
-- **§8** Reconciling an external **Redshift** source via a UC connection + `remote_query`
-  (DBR 17.3+); same pattern for oracle/snowflake/mssql/synapse/teradata/bigquery.
-- **§9** Gotchas & fixes (all hit during verification).
+## The notebooks
 
-> Verified end-to-end on 2026-07-30 (workspace `dbc-e8d3f54c-ce8c`, classic cluster,
-> DBR 17.3, Databricks-to-Databricks). The Redshift path is documented from the connector
-> source but was not run live.
+| Notebook | What it does |
+|---|---|
+| [`lakebridge_analyzer_offline.py`](./lakebridge_analyzer_offline.py)   | **Analyzer** — scans source SQL/ETL files, scores the migration (Excel report) |
+| [`lakebridge_transpile_offline.py`](./lakebridge_transpile_offline.py) | **Transpiler** — rewrites source SQL into Databricks SQL (sqlglot; no Java) |
+| [`lakebridge_reconcile_offline.py`](./lakebridge_reconcile_offline.py) | **Reconciler** — checks a source table and a Databricks table match |
+| [`lakebridge_profiler_offline.py`](./lakebridge_profiler_offline.py)   | **Profiler** — captures source DB sizing/usage into a DuckDB extract (for TCO) |
 
-## Notebooks (companions to the runbook)
+For each one: **import it → edit the CONFIG cell at the top → Run All** on a classic cluster.
 
-| File | Stage | Notes |
-|---|---|---|
-| `lakebridge_analyzer_offline.py`  | Analyzer   | Offline `--no-index --find-links` install; RUNBOOK §6 |
-| `lakebridge_reconcile_offline.py` | Reconciler | Offline install; classic cluster; RUNBOOK §5, §7, §8 |
+## The essentials (all explained in the RUNBOOK)
 
-Edit the CONFIG cell (wheelhouse path, catalog/schema/volume, tables) and run each as a
-one-off job on the classic cluster. The offline `%pip` line has the wheelhouse path
-hard-coded in the magic (magics can't read Python vars) — update it to match `WHEELS_DIR`.
+- **Install offline.** Download the package on a laptop, upload the "wheelhouse" to a UC volume,
+  and install with `%pip install --no-index --find-links=/Volumes/.../wheels ...`.
+- **Use a classic cluster, DBR 17.3+.** Serverless can't run the Reconciler or Profiler.
+- **Reports write to local disk first, then copy to the volume** (UC Volumes can't do the
+  in-place writes the Excel/DuckDB writers need).
+- **Reaching an outside database:** the Reconciler uses a UC connection (Lakehouse Federation);
+  the Profiler connects directly, so the cluster needs a network route to that database. See the
+  RUNBOOK's "Connecting to an outside database" section.
 
-## Key differences vs the regular folder
-
-- **Install:** offline wheelhouse on a UC Volume, not PyPI.
-- **Compute:** **classic cluster** required (serverless can't persist reconcile results and
-  can't host a JDK). DBR **17.3+** if using `remote_query`/external sources.
-- Everything else (engine calls, local-scratch-then-copy for the report, the reconcile
-  backend layout) is identical to the regular path.
+> ✅ Verified end-to-end on **Lakebridge 0.15.0**, DBR 17.3, in an air-gapped workspace —
+> Analyzer, Transpiler, Reconciler, and Profiler (against a private Redshift) all pass.
