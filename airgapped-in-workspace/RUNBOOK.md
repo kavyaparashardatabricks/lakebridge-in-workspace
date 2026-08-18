@@ -1,304 +1,174 @@
-# Lakebridge in an air-gapped Databricks workspace — install + Reconciler runbook
+# Running Lakebridge in an air-gapped Databricks workspace — step by step
 
-Run the Lakebridge **Analyzer** and **Reconciler** entirely **inside a Databricks
-workspace notebook** — no Databricks CLI `labs install`, no `configure-reconcile`, no
-desktop app — on a workspace whose **compute has no outbound internet**.
+This is a plain, follow-along guide for running the three Lakebridge tools **inside a Databricks
+workspace whose clusters have no internet**:
 
-Verified end-to-end on 2026-07-30 in workspace `dbc-e8d3f54c-ce8c` (profile `capri-ws`)
-on classic cluster `0729-064211-m5g0e77z` (DBR 17.3, `USER_ISOLATION`), Databricks-to-
-Databricks. The Redshift source path (§8) is documented from the connector source but was
-not run live (no Redshift endpoint available).
+- **Analyzer** — scans your old SQL/ETL files and scores the migration effort (Excel report).
+- **Reconciler** — checks that a source table and a Databricks table hold the same data.
+- **Profiler** — connects to your source database and captures sizing/usage stats (for TCO).
 
----
+No Databricks CLI `labs install`, no `configure-reconcile`, no desktop app. Everything runs as
+notebooks. The only trick for an air-gapped cluster is **how you install Lakebridge**: because the
+cluster can't reach the internet, you download the package once on a normal machine, copy it into
+the workspace, and install it from there.
 
-## 0. Why this is needed / TL;DR
-
-The standard install (`databricks labs install lakebridge` + `configure-reconcile`) assumes
-outbound GitHub/PyPI access from the install host **and** internet from the cluster. In a
-locked-down workspace both break:
-
-- `%pip install databricks-labs-lakebridge` on the cluster fails with
-  `[Errno 101] Network is unreachable` (no route to pypi.org).
-- The `%pip` magic **hides the real error** behind a generic
-  `CalledProcessError ... non-zero exit status 1` — you must reproduce with `subprocess`
-  to see the underlying pip message.
-
-The fix is the same pattern the Barclays / private-PyPI playbooks describe, applied at the
-notebook level instead of the CLI:
-
-1. Build a **wheelhouse** (all wheels + transitive deps) on an internet-connected host,
-   targeting the **cluster's** Python/OS (not the host's).
-2. Upload the wheelhouse to a **Unity Catalog Volume**.
-3. `%pip install --no-index --find-links=/Volumes/.../wheels ...` inside the notebook.
-4. Call the engine classes directly (`Analyzer.analyze`, `TriggerReconService.trigger_recon`).
-5. Pre-create the reconcile backend (catalog/schema/volume) yourself — the bits
-   `configure-reconcile` normally makes.
-
-Nothing about the *data path* to a source system needs new cluster egress — federation
-(`remote_query`) is handled by the Databricks compute plane via a UC connection (§8).
+> ✅ Verified end-to-end on **Lakebridge 0.15.0**, DBR 17.3, a classic cluster in an air-gapped
+> (no-internet) workspace — Analyzer, Reconciler (Databricks-to-Databricks), and
+> Profiler (against a private Redshift) all pass.
 
 ---
 
-## 1. Prerequisites
+## Before you start
 
-**Connected host** (has internet — your laptop/build box):
-- Databricks CLI configured with a profile for the target workspace (here `capri-ws`).
-- Python + `pip` (only used to *download* wheels).
+You need:
 
-**Target workspace:**
-- A **classic cluster** or **Pro/Serverless SQL warehouse**. Use a **classic cluster for
-  reconcile** — serverless is unsupported for the reconcile persist step
-  (`PERSIST TABLE not supported on serverless`). DBR **17.3+** if you'll use Redshift/`remote_query`.
-- Unity Catalog enabled; a catalog you can write to (here `kp_capri`).
-- Permission to create schemas, volumes, and (for external sources) a UC connection.
+1. **A machine with internet** (your laptop) that has Python + `pip` and the
+   [Databricks CLI](https://docs.databricks.com/en/dev-tools/cli/index.html) configured with a
+   profile for your workspace. In the commands below that profile is called `WS`.
+2. **A classic cluster** in the workspace running **DBR 17.3 or newer**. (Serverless won't work for
+   the Reconciler or Profiler.) Note its **cluster id**.
+3. **A Unity Catalog volume** you can write to. We'll use `/Volumes/<catalog>/default/lakebridge/`
+   in the examples — replace `<catalog>` with your catalog name everywhere.
 
-**Match the wheelhouse to the cluster runtime:**
-- DBR 17.3 ⇒ **Python 3.12**, Linux **x86_64**. Download `cp312` / `manylinux` wheels.
-- Confirm with: `databricks clusters get <cluster-id> -p <profile> | grep spark_version`.
+Two facts that explain the whole approach:
+
+- The cluster's Python is **3.12** on **Linux x86_64** (that's what DBR 17.3 ships). The offline
+  package files ("wheels") you download must match that, so we tell `pip` to fetch `cp312` /
+  `manylinux` wheels.
+- Unity Catalog Volumes are a network file share that can't do the "random-access" writes some file
+  formats need. So whenever a tool writes a report/extract, we write it to the cluster's local disk
+  first and then copy the finished file onto the Volume.
 
 ---
 
-## 2. Set variables
+## Part A — One-time setup
+
+Do this once. It gets Lakebridge onto the cluster and creates the folders the tools use.
+
+### Step 1 — Download Lakebridge on your laptop (the "wheelhouse")
+
+On your internet-connected laptop:
 
 ```bash
-export PROFILE=capri-ws
-export CLUSTER_ID=0729-064211-m5g0e77z
-export CATALOG=kp_capri
-export WHEELS_VOL=/Volumes/$CATALOG/default/lakebridge/wheels
-export SQL_WAREHOUSE_ID=aa438606b544d7b4     # Pro warehouse, for running setup SQL
-export USER_HOME=/Users/kavya.parashar@databricks.com
-```
-
-Sanity-check auth and compute:
-
-```bash
-databricks current-user me -p $PROFILE
-databricks clusters get $CLUSTER_ID -p $PROFILE --output json | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['spark_version'],d['state'])"
-```
-
----
-
-## 3. Build the wheelhouse (connected host)
-
-```bash
-rm -rf /tmp/lb_wheels && mkdir -p /tmp/lb_wheels
-pip download databricks-labs-lakebridge openpyxl \
+mkdir -p /tmp/lb_wheels
+pip download databricks-labs-lakebridge openpyxl greenlet \
   --dest /tmp/lb_wheels \
-  --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 --platform any \
+  --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux_2_28_x86_64 \
   --python-version 312 --implementation cp --only-binary=:all:
-ls /tmp/lb_wheels/*.whl | wc -l          # ~90 wheels
+ls /tmp/lb_wheels/*.whl | wc -l      # ~90 files
 ```
 
-**Watch for missing transitive binary deps.** `pip download` on a mac/py3.13 host can skip
-platform-specific wheels. In testing, **`greenlet`** (a `sqlalchemy` dep) was missing and
-had to be fetched explicitly for cp312/linux:
+That folder ("wheelhouse") holds Lakebridge plus every library it depends on. A few notes:
+
+- The three `--platform` flags matter: newer dependencies (e.g. `duckdb`, used by the Profiler)
+  only ship `manylinux_2_28` wheels. Leaving that flag out gives a "no matching distribution" error.
+- `greenlet` is a dependency that `pip download` sometimes skips on a Mac — listing it explicitly
+  makes sure it's included.
+- **Don't pin extra versions** (like `duckdb==…`) on this line — let Lakebridge choose its own; the
+  Profiler's needs (`redshift_connector`, `duckdb`, `sqlalchemy`) come along automatically.
+
+### Step 2 — Copy the wheelhouse into the workspace
 
 ```bash
-pip download greenlet --dest /tmp/lb_wheels \
-  --platform manylinux_2_17_x86_64 --platform manylinux_2_28_x86_64 \
-  --python-version 312 --implementation cp --only-binary=:all:
-```
-
-The Analyzer engine (`databricks.labs.bladespector`) ships in the **`databricks-bb-analyzer`**
-wheel, which is pulled in as a dependency — confirm `databricks_bb_analyzer-*.whl` is present.
-
-> Tip: if the offline install later errors with
-> `Could not find a version that satisfies the requirement <pkg>`, that package is missing
-> from the wheelhouse — download it with the same `--platform/--python-version` flags and
-> re-upload. This is the main iteration loop.
-
----
-
-## 4. Upload the wheelhouse to a UC Volume
-
-```bash
-# create the volume + folder (once)
-databricks volumes create $CATALOG default lakebridge MANAGED -p $PROFILE
-databricks fs mkdir dbfs:$WHEELS_VOL -p $PROFILE
-
-# upload (parallelised — serial upload of ~90 wheels is slow)
+export WHEELS=/Volumes/<catalog>/default/lakebridge/wheels
+databricks fs mkdir "dbfs:$WHEELS" -p WS
+# upload all the wheels (parallel; a serial upload of ~90 files is slow)
 ls /tmp/lb_wheels/*.whl | xargs -P 6 -I {} \
-  databricks fs cp "{}" "dbfs:$WHEELS_VOL/$(basename {})" --overwrite -p $PROFILE
-
-databricks fs ls dbfs:$WHEELS_VOL -p $PROFILE | wc -l    # should equal local count
+  databricks fs cp "{}" "dbfs:$WHEELS/$(basename {})" --overwrite -p WS
+# sanity check: the count here should equal the local count
+databricks fs ls "dbfs:$WHEELS" -p WS | grep -c '\.whl$'
 ```
+
+> Tip: parallel uploads occasionally drop a file or two — if the counts don't match, re-run the
+> upload for the missing ones.
+
+### Step 3 — Create the folders and the reconcile backend
+
+```bash
+# input/output folders the notebooks use
+databricks fs mkdir "dbfs:/Volumes/<catalog>/default/lakebridge/input"  -p WS
+databricks fs mkdir "dbfs:/Volumes/<catalog>/default/lakebridge/output" -p WS
+
+# the Reconciler needs a metadata schema + a volume (this is what `configure-reconcile` normally makes)
+databricks schemas create lb_recon <catalog> -p WS
+databricks volumes create <catalog> lb_recon reconcile_volume MANAGED -p WS
+```
+
+You're set up. From here, each tool is just: **import the notebook → edit the CONFIG cell → Run All.**
 
 ---
 
-## 5. Pre-create the reconcile backend
+## How to run any of the notebooks
 
-`configure-reconcile` normally creates these; do it by hand. The metadata **catalog +
-schema must pre-exist** (result tables `main`/`metrics`/`details` auto-create via
-`saveAsTable`). A **UC Volume is required even on classic compute** — intermediate data is
-persisted to the volume whenever `DATABRICKS_RUNTIME_VERSION` is set, not just on serverless.
+Each tool below is a notebook in this folder. For every one:
+
+1. Import it into the workspace (UI: **Workspace → Import**, or the CLI below).
+2. Open it, edit the **CONFIG** cell at the top (paths, catalog, etc.).
+3. Attach it to your **classic cluster** and **Run All** — or submit it as a one-off job:
 
 ```bash
-run_sql () { databricks api post /api/2.0/sql/statements -p $PROFILE --json \
-  "{\"warehouse_id\":\"$SQL_WAREHOUSE_ID\",\"statement\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"),\"wait_timeout\":\"30s\"}"; }
+databricks workspace import "/Users/<you>/lakebridge_analyzer" \
+  --file ./lakebridge_analyzer_offline.py --language PYTHON --format SOURCE --overwrite -p WS
 
-run_sql "CREATE SCHEMA IF NOT EXISTS $CATALOG.lb_recon"
-databricks volumes create $CATALOG lb_recon reconcile_volume MANAGED -p $PROFILE
+databricks jobs submit -p WS --json '{
+  "run_name": "lakebridge-analyzer",
+  "tasks": [{"task_key":"run","existing_cluster_id":"<cluster-id>",
+             "notebook_task":{"notebook_path":"/Users/<you>/lakebridge_analyzer"}}]}'
 ```
 
-So the metadata config will be: catalog `kp_capri`, schema `lb_recon`, volume `reconcile_volume`.
+> **One thing to remember:** the `%pip install` line inside each notebook has the wheelhouse path
+> written into it directly (a `%pip` line can't read a Python variable). If you change `WHEELS_DIR`
+> in the CONFIG cell, update that `%pip` line to match.
 
 ---
 
-## 6. Analyzer — in-workspace, offline
+## Part B — Run the three tools
 
-### 6a. Stage source metadata (exported SQL / ETL files) on a Volume
+### 1. Analyzer — `lakebridge_analyzer_offline.py`
 
-```bash
-databricks fs mkdir dbfs:/Volumes/$CATALOG/default/lakebridge/input  -p $PROFILE
-databricks fs mkdir dbfs:/Volumes/$CATALOG/default/lakebridge/output -p $PROFILE
-# upload your .sql / ETL export files into .../input
-databricks fs cp ./my_source.sql dbfs:/Volumes/$CATALOG/default/lakebridge/input/my_source.sql -p $PROFILE
-```
+Point it at a folder of exported source SQL files and it produces `report.xlsx` (a multi-tab
+Excel workbook scoring the migration) plus `report.json`.
 
-### 6b. Analyzer notebook (`lakebridge_analyzer.py`)
+- Put your exported `.sql` files in `.../lakebridge/input`.
+- In CONFIG set `PLATFORM` to your source — e.g. `"Redshift"`, `"Oracle"`, `"Snowflake"`
+  (the notebook prints the full list of valid names and checks yours).
+- Run it. You'll get `report.xlsx` + `report.json` in `.../lakebridge/output`.
 
-```python
-# Databricks notebook source
-# Offline install from the UC-Volume wheelhouse (no internet on the cluster).
-%pip install --no-index --find-links=/Volumes/kp_capri/default/lakebridge/wheels databricks-labs-lakebridge openpyxl
-dbutils.library.restartPython()
+### 2. Reconciler — `lakebridge_reconcile_offline.py`
 
-# COMMAND ----------
-import shutil, tempfile, json
-from pathlib import Path
-from databricks.labs.bladespector.analyzer import Analyzer     # NOT ApplicationContext
+Compares a source table and a target table (schema, row counts, and values) and writes the results
+to `<catalog>.lb_recon.{main, metrics, details}`.
 
-SOURCE_DIR = "/Volumes/kp_capri/default/lakebridge/input"
-OUTPUT_DIR = "/Volumes/kp_capri/default/lakebridge/output"
-PLATFORM   = "Oracle"     # must be in Analyzer.supported_source_technologies()
+- Simplest case (**Databricks-to-Databricks**): leave `DIALECT="databricks"` and
+  `UC_CONNECTION=None`, list your `(source_table, target_table, [join_columns])` in `TABLES`, run it.
+- Reading from an **outside database** (Redshift, Oracle, …): see **Part C** below.
+- Must run on the **classic cluster** (serverless can't save the results).
 
-src, vol_out = Path(SOURCE_DIR), Path(OUTPUT_DIR)
-local_out  = Path(tempfile.mkdtemp(prefix="lakebridge_"))   # seekable local scratch
-local_xlsx = local_out / "report.xlsx"
-local_json = local_out / "report.json"
+### 3. Profiler — `lakebridge_profiler_offline.py`
 
-assert src.is_dir() and any(src.iterdir()), f"empty/missing source dir: {src}"
-vol_out.mkdir(parents=True, exist_ok=True)
-assert PLATFORM in Analyzer.supported_source_technologies()
+Connects to your source database and captures sizing/usage stats into a **DuckDB file**
+(`profiler_extract_<source>_<version>_<date>.db`) you can feed into the TCO tooling.
 
-# write to LOCAL scratch first, then copy to the Volume (see gotcha below)
-Analyzer.analyze(src, local_xlsx, PLATFORM, False, local_json)
-assert local_xlsx.stat().st_size > 5000, "report looks corrupt (empty dir / wrong platform?)"
-shutil.copy(local_xlsx, vol_out / "report.xlsx")
-if local_json.exists(): shutil.copy(local_json, vol_out / "report.json")
-print("done:", [p.name for p in vol_out.iterdir()])
-```
-
-### 6c. Run it as a one-off job on the classic cluster
-
-```bash
-databricks workspace import $USER_HOME/lakebridge_analyzer \
-  --file ./lakebridge_analyzer.py --language PYTHON --format SOURCE --overwrite -p $PROFILE
-
-cat > /tmp/analyzer_job.json <<EOF
-{"run_name":"lakebridge-analyzer","tasks":[{"task_key":"analyze",
-  "existing_cluster_id":"$CLUSTER_ID",
-  "notebook_task":{"notebook_path":"$USER_HOME/lakebridge_analyzer"}}]}
-EOF
-databricks jobs submit --no-wait --json @/tmp/analyzer_job.json -p $PROFILE
-# poll: databricks jobs get-run <run_id> -p $PROFILE --output json
-```
-
-**Verified result:** 4 Oracle files → `report.xlsx` (18.1 KB) + `report.json`, **14
-worksheets** (Summary, SQL Programs, Loops & Cursors, Functions, Program-Object Xref, …).
+- Unlike the other tools, the Profiler **connects directly to the source database** — so the
+  cluster needs a **network route to it** (see Part C).
+- Put the database connection details in a **secret scope** (the notebook's CONFIG cell shows the
+  exact `databricks secrets` commands). Never hard-code the password.
+- Run it. It prints the tables captured and copies the `.db` extract to `.../lakebridge/profiler`.
 
 ---
 
-## 7. Reconciler — in-workspace, offline (Databricks-to-Databricks)
+## Part C — Connecting to an outside database (Redshift, Oracle, Snowflake, …)
 
-This is the path proven live. External sources (Redshift) differ only in the `source`
-block + a UC connection — see §8.
+Two of the tools can talk to a non-Databricks source, and they do it **differently**:
 
-### 7a. Reconcile notebook (`lakebridge_reconcile.py`)
+| Tool | How it connects | What it needs |
+|---|---|---|
+| **Reconciler** | Through Databricks **Lakehouse Federation** — a `remote_query()` run by the Databricks compute plane via a **UC connection**. | A UC connection (below), DBR 17.3+. |
+| **Profiler** | A **direct** connection from the cluster to the database (e.g. Redshift port 5439). | A **network route** from the workspace's compute network to the database (VPC peering / PrivateLink / a security-group rule). No internet. |
 
-```python
-# Databricks notebook source
-%pip install --no-index --find-links=/Volumes/kp_capri/default/lakebridge/wheels databricks-labs-lakebridge
-dbutils.library.restartPython()
+### Create a UC connection (for the Reconciler)
 
-# COMMAND ----------
-import json
-from databricks.sdk import WorkspaceClient
-from pyspark.sql import SparkSession
-from databricks.labs.lakebridge.config import (
-    ReconcileConfig, ReconcileMetadataConfig, TableRecon,
-    SourceConnectionConfig, TargetConnectionConfig)
-from databricks.labs.lakebridge.reconcile.recon_config import Table
-from databricks.labs.lakebridge.reconcile.trigger_recon_service import TriggerReconService
-from databricks.labs.lakebridge.reconcile.exception import ReconciliationException
-
-spark = SparkSession.builder.getOrCreate()
-ws = WorkspaceClient()
-
-reconcile_config = ReconcileConfig(
-    report_type="all",     # schema + row + data ("schema"|"data"|"row"|"all"|"aggregate")
-    source=SourceConnectionConfig(
-        dialect="databricks", catalog="kp_capri", schema="default",
-        uc_connection_name=None),                 # None => databricks dialect
-    target=TargetConnectionConfig(catalog="kp_capri", schema="default"),
-    metadata_config=ReconcileMetadataConfig(
-        catalog="kp_capri", schema="lb_recon", volume="reconcile_volume"),
-)
-table_recon = TableRecon(tables=[
-    Table(source_name="customers_src", target_name="customers_tgt", join_columns=["id"]),
-])
-
-try:
-    out = TriggerReconService.trigger_recon(ws, spark, table_recon, reconcile_config)
-    print(json.dumps({"ok": True, "recon_id": out.recon_id, "repr": repr(out)[:2000]}))
-    dbutils.notebook.exit(out.recon_id)
-except ReconciliationException as e:
-    print("RECON EXCEPTION:", e)
-    raise
-```
-
-### 7b. Run it (same submit pattern as §6c, pointing at `lakebridge_reconcile`).
-
-### 7c. Inspect results
-
-```bash
-run_sql "SELECT recon_metrics.row_comparison, recon_metrics.column_comparison
-         FROM $CATALOG.lb_recon.metrics m
-         JOIN $CATALOG.lb_recon.main mn ON m.recon_table_id = mn.recon_table_id
-         WHERE mn.recon_id = '<recon_id>'"
-```
-
-**Verified result** (`recon_id=e360b2ba...`), with deliberate diffs planted in the demo data:
-- `missing_in_target: 1` (row only in source), `missing_in_source: 1` (row only in target),
-- `absolute_mismatch: 1, mismatch_columns: balance` (a changed value),
-- schema matched (`schema=True`), so `status.row=False, column=False, schema=True`.
-
-Result tables land in `kp_capri.lb_recon.{main, metrics, details}` keyed by `recon_id`.
-
----
-
-## 8. Reconciling against an external Redshift source
-
-Only the **source** side and one **UC connection** change; everything above (wheelhouse,
-backend, target read, metadata) is identical.
-
-### 8a. How it connects (important)
-
-Despite the `JdbcReaderOptions` name, the Redshift connector does **not** open JDBC from the
-notebook driver. Every read is rewritten into a Databricks **Lakehouse Federation**
-`remote_query()` call and executed via `spark.sql`:
-
-```sql
-SELECT * FROM remote_query('<uc_connection>', database => '<db>', query => 'SELECT ... FROM schema.table')
-```
-
-The Databricks **compute plane** (not your notebook) connects to Redshift, runs the
-read-only query in Redshift's engine, and returns a Spark DataFrame. Target-side reads and
-the comparison/metadata writes are unchanged from §7. Net effect: **no extra cluster egress
-for data** — only network reachability from Databricks compute to Redshift, plus the
-already-solved offline package install.
-
-### 8b. One-time: create the UC connection to Redshift
+Run this once (SQL editor or a notebook). Store the credentials as Databricks secrets first.
 
 ```sql
 CREATE CONNECTION my_redshift_conn TYPE redshift
@@ -306,72 +176,54 @@ OPTIONS (
   host '<redshift-endpoint>',
   port '5439',
   user     secret('<scope>','<user-key>'),
-  password secret('<scope>','<pwd-key>')
+  password secret('<scope>','<password-key>')
 );
 ```
 
-Requirements: UC metastore enabled; `CREATE CONNECTION` to create it, `USE CONNECTION` to
-query it; **`remote_query` is a public-preview feature** needing **DBR 17.3+** (clusters) or
-a Pro/Serverless SQL warehouse `2025.35+`; and **network routing (VPC/security groups)** from
-Databricks compute to the Redshift cluster. `remote_query` is **read-only** (no
-INSERT/UPDATE/DDL/procedures) — fine for reconcile.
+Then in the Reconciler CONFIG set `DIALECT="redshift"` and `UC_CONNECTION="my_redshift_conn"`.
+The same pattern works for `oracle`, `snowflake`, `mssql`/`synapse`, `teradata`, `bigquery`.
 
-### 8c. Change only the source block in the reconcile notebook
+### Make sure the network path exists (for the Profiler, and for the Reconciler's reads)
+
+Because the source database is usually private too, the workspace's compute network must be able to
+reach it. Typical options (ask your cloud/network admin):
+
+- **VPC peering** between the workspace network and the database's network, plus a firewall/
+  security-group rule allowing the database port (Redshift is `5439`).
+- Or a **PrivateLink / managed endpoint** to the database.
+
+A quick way to confirm the path works from a notebook cell:
 
 ```python
-source=SourceConnectionConfig(
-    dialect="redshift",
-    catalog="<redshift_database>",       # maps to remote_query's `database =>`
-    schema="<redshift_schema>",
-    uc_connection_name="my_redshift_conn",   # non-null => routes to RedshiftDataSource
-),
-target=TargetConnectionConfig(catalog="<dbx_catalog>", schema="<dbx_schema>"),
-...
-table_recon = TableRecon(tables=[
-    Table(source_name="<redshift_table>", target_name="<dbx_table>", join_columns=["<pk>"]),
-])
+import socket; socket.create_connection(("<db-host>", 5439), timeout=10)
+print("reachable")   # no error = the cluster can reach the database
 ```
 
-`initialise_data_source` uses a non-null `uc_connection_name` to select the
-`RedshiftDataSource` adapter; leaving it `None` forces the `databricks` dialect.
-
-Supported external dialects (same pattern, different `TYPE`/connection): `oracle`, `snowflake`,
-`mssql`/`synapse`, `redshift`, `teradata`, `bigquery`.
-
 ---
 
-## 9. Gotchas & fixes (all hit during verification)
+## Troubleshooting (the things that actually go wrong)
 
-| Symptom | Cause | Fix |
+| What you see | Why | Fix |
 |---|---|---|
-| `[Errno 101] Network is unreachable` on `%pip install` | Cluster has no internet | Offline wheelhouse on a UC Volume + `--no-index --find-links` (§3–4) |
-| `%pip` fails with only `CalledProcessError ... exit status 1` | The `%pip` magic swallows pip's real stderr | Reproduce with `subprocess.run([sys.executable,"-m","pip",...], capture_output=True)` and print `stderr` |
-| `Could not find a version that satisfies the requirement greenlet` (or other) | Transitive binary wheel missing from wheelhouse | `pip download <pkg>` with matching `--platform/--python-version`, re-upload |
-| `NotADirectoryError: Cannot find project root` | Imported `ApplicationContext` | Call `databricks.labs.bladespector.analyzer.Analyzer.analyze(...)` directly |
-| `report.xlsx` is ~390 bytes / corrupt | Wrote `.xlsx` straight to a UC Volume (FUSE can't do random-access seeks) | Write to local scratch (`tempfile.mkdtemp()`), then `shutil.copy` to the Volume |
-| `/local_disk0` read-only | Serverless | Use `tempfile.mkdtemp()` (writes under `/tmp`); prefer classic cluster |
-| `PERSIST TABLE not supported on serverless` (reconcile) | Reconcile on serverless | Run reconcile on a **classic cluster** / Pro warehouse |
-| Reconcile fails writing intermediate data | Missing `reconcile_volume` even on classic | Create the UC Volume (§5) — required whenever `DATABRICKS_RUNTIME_VERSION` is set |
-| Redshift recon: `remote_query` not recognised | Preview not enabled / old runtime | Enable `remote_query` preview; DBR 17.3+ or SQL warehouse `2025.35+` |
-| `openpyxl` import error when inspecting the workbook | Not preinstalled on serverless | Add `openpyxl` to the `%pip install` line |
+| `%pip install` fails with `[Errno 101] Network is unreachable` | You installed from PyPI, not the offline wheelhouse | Use the `--no-index --find-links=<wheelhouse>` line (that's what the notebooks do) |
+| `%pip` only says `CalledProcessError ... exit status 1` | The `%pip` magic hides pip's real error | Re-run the install with `subprocess` and print `stderr` to see the actual missing package |
+| `Could not find a version that satisfies the requirement <pkg>` | That package is missing from the wheelhouse (or a wrong platform) | On your laptop, `pip download <pkg>` with the same `--platform/--python-version` flags and re-upload |
+| `No matching distribution found for duckdb~=1.4.5` | Missing the newer glibc platform tag | Add `--platform manylinux_2_28_x86_64` to the Step 1 download |
+| `NotADirectoryError: Cannot find project root` | You imported the CLI's `ApplicationContext` | Call the engine classes directly (the notebooks already do this) |
+| `report.xlsx` is ~390 bytes / corrupt | Wrote the Excel file straight to a Volume | Write to local scratch first, then copy to the Volume (the notebooks do this) |
+| `PERSIST TABLE not supported on serverless` (Reconciler) | Ran on serverless | Use a **classic cluster** |
+| Reconciler fails writing intermediate data | Missing the `reconcile_volume` | Create it (Part A, Step 3) |
+| `WriteToTableException: schema mismatch ... lb_recon.details` | The `lb_recon` result tables were made by an older Lakebridge version | Drop `lb_recon.{main,metrics,details}` and re-run so the new version recreates them |
+| Reconciler with a Redshift source: `remote_query` not recognised | Feature not enabled / old runtime | Use DBR 17.3+ (or a Pro/Serverless SQL warehouse `2025.35+`) |
+| Profiler: `cannot import name 'DatabaseManager'` | Lakebridge 0.15.0 renamed it | Use `create_connector(...)` (the notebook already handles both versions) |
+| Profiler can't connect to the database | No network route from the cluster to the source | Set up VPC peering / PrivateLink + a firewall rule (Part C) |
 
 ---
 
-## 10. What lives where after a run
+## What lives where after a run
 
-- **Notebooks:** `<USER_HOME>/lakebridge_analyzer`, `<USER_HOME>/lakebridge_reconcile`.
-- **Wheelhouse:** `/Volumes/<catalog>/default/lakebridge/wheels` (~90 wheels).
-- **Analyzer I/O:** `.../lakebridge/input` (sources), `.../lakebridge/output` (`report.xlsx` + `report.json`).
-- **Reconcile backend:** schema `<catalog>.lb_recon` (tables `main`/`metrics`/`details`) + volume `reconcile_volume`.
-- **UC connections** (external sources only): e.g. `my_redshift_conn`.
-
----
-
-## 11. Reusing across a new workspace / release
-
-1. Rebuild the wheelhouse for the target cluster's Python/OS (pin the Lakebridge version).
-2. Re-upload wheels; re-create `lb_recon` schema + `reconcile_volume`.
-3. For external sources, create the UC connection + enable `remote_query`.
-4. Import the two notebooks; submit as one-off jobs on a classic cluster.
-
-No CLI install, no `configure-reconcile`, no desktop app required at any point.
+- **Wheelhouse:** `/Volumes/<catalog>/default/lakebridge/wheels`
+- **Analyzer:** input `.../input`, output `.../output` (`report.xlsx` + `report.json`)
+- **Reconciler:** results in `<catalog>.lb_recon.{main, metrics, details}`
+- **Profiler:** `.../profiler/profiler_extract_<source>_<version>_<date>.db`
+- **UC connections** (external sources): e.g. `my_redshift_conn`

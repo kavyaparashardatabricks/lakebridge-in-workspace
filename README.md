@@ -1,7 +1,7 @@
 # Lakebridge in workspace
 
 Run the [Databricks Lakebridge](https://databrickslabs.github.io/lakebridge/) migration
-tools — **Analyzer** (assessment), **Transpiler**, and **Reconciler** — directly inside a
+tools — **Analyzer** (assessment), **Reconciler**, and **Profiler** — directly inside a
 Databricks workspace notebook. **No Databricks CLI** (`labs install` /
 `configure-reconcile`), **no desktop app** — everything runs as notebooks/jobs in the
 workspace by calling the Lakebridge engine classes directly.
@@ -20,13 +20,14 @@ is installed** (PyPI vs an offline wheelhouse on a UC Volume) and the required *
 ### `regular-in-workspace/`
 - `lakebridge_analyzer.py` — Assessment/Analyzer. ✅ Verified end-to-end on **AWS** and **Azure**.
 - `lakebridge_reconcile.py` — Reconciler (`TriggerReconService.trigger_recon`). ✅ Verified (D2D).
-- `lakebridge_transpile.py` — Transpiler (pure-Python `sqlglot` engine, no Java). ✅ Verified end-to-end (Azure); SQL-only, route PL/SQL to Morpheus/Switch.
 
 ### `airgapped-in-workspace/`
-- `RUNBOOK.md` — **the full verified offline procedure** (wheelhouse build/upload, backend
-  pre-create, Analyzer + Reconciler, external Redshift source, gotchas). Start here.
-- `lakebridge_analyzer_offline.py`, `lakebridge_reconcile_offline.py` — offline-install
-  companions to the runbook.
+- `RUNBOOK.md` — **a plain, step-by-step offline walkthrough** (download the package, upload to a
+  UC volume, then run each tool). Covers all three tools + connecting to an external database. Start here.
+- `lakebridge_analyzer_offline.py`, `lakebridge_reconcile_offline.py`,
+  `lakebridge_profiler_offline.py` — offline-install notebooks.
+- ✅ Verified end-to-end on **Lakebridge 0.15.0**, DBR 17.3, in an air-gapped workspace — Analyzer,
+  Reconciler, and Profiler (against a private Redshift) all pass.
 
 ## The three things that make in-workspace runs work
 
@@ -47,7 +48,5 @@ is installed** (PyPI vs an offline wheelhouse on a UC Volume) and the required *
   run the same notebook on a **classic cluster** with no code changes.
 - **Reconciler** requires a **classic cluster** (or Pro SQL warehouse). Use **DBR 17.3+** for
   external sources via `remote_query`/Lakehouse Federation.
-- **Transpiler**: the notebook uses the pure-Python **`sqlglot`** engine (no Java, no
-  `install-transpile`) — verified on serverless/classic. For PL/SQL procedural code beyond
-  sqlglot's SQL scope, use **Morpheus** (needs Java 21) or **Switch** (LLM job, token-metered);
-  the productized **agentic converter** (`/migrate`) is recommended going forward.
+- **Profiler** connects directly to the source database, so the cluster needs a network route to
+  it; it runs on a **classic cluster** and writes a DuckDB extract (see the air-gapped folder).
