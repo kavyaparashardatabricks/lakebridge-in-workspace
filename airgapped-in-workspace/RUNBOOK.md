@@ -1,10 +1,9 @@
 # Running Lakebridge in an air-gapped Databricks workspace — step by step
 
-This is a plain, follow-along guide for running the four Lakebridge tools **inside a Databricks
+This is a plain, follow-along guide for running the three Lakebridge tools **inside a Databricks
 workspace whose clusters have no internet**:
 
 - **Analyzer** — scans your old SQL/ETL files and scores the migration effort (Excel report).
-- **Transpiler** — rewrites source SQL (Redshift, Oracle, …) into Databricks SQL.
 - **Reconciler** — checks that a source table and a Databricks table hold the same data.
 - **Profiler** — connects to your source database and captures sizing/usage stats (for TCO).
 
@@ -14,7 +13,7 @@ cluster can't reach the internet, you download the package once on a normal mach
 the workspace, and install it from there.
 
 > ✅ Verified end-to-end on **Lakebridge 0.15.0**, DBR 17.3, a classic cluster in an air-gapped
-> (no-internet) workspace — Analyzer, Transpiler, Reconciler (Databricks-to-Databricks), and
+> (no-internet) workspace — Analyzer, Reconciler (Databricks-to-Databricks), and
 > Profiler (against a private Redshift) all pass.
 
 ---
@@ -123,7 +122,7 @@ databricks jobs submit -p WS --json '{
 
 ---
 
-## Part B — Run the four tools
+## Part B — Run the three tools
 
 ### 1. Analyzer — `lakebridge_analyzer_offline.py`
 
@@ -135,18 +134,7 @@ Excel workbook scoring the migration) plus `report.json`.
   (the notebook prints the full list of valid names and checks yours).
 - Run it. You'll get `report.xlsx` + `report.json` in `.../lakebridge/output`.
 
-### 2. Transpiler — `lakebridge_transpile_offline.py`
-
-Rewrites every `.sql` file in the input folder into Databricks SQL.
-
-- In CONFIG set `SRC_DIALECT` (e.g. `"redshift"`) and leave `TGT_DIALECT="databricks"`.
-- Run it. Converted files land in `.../lakebridge/transpiled`, and it prints how many statements
-  converted and any errors per file.
-- It uses the built-in **sqlglot** engine (pure Python, no Java, no internet). It handles ordinary
-  SQL well (e.g. `NVL`→`COALESCE`, `GETDATE()`→`CURRENT_TIMESTAMP()`). Procedural PL/SQL blocks
-  come out only partly converted — check the error count and hand those to Morpheus/Switch.
-
-### 3. Reconciler — `lakebridge_reconcile_offline.py`
+### 2. Reconciler — `lakebridge_reconcile_offline.py`
 
 Compares a source table and a target table (schema, row counts, and values) and writes the results
 to `<catalog>.lb_recon.{main, metrics, details}`.
@@ -156,7 +144,7 @@ to `<catalog>.lb_recon.{main, metrics, details}`.
 - Reading from an **outside database** (Redshift, Oracle, …): see **Part C** below.
 - Must run on the **classic cluster** (serverless can't save the results).
 
-### 4. Profiler — `lakebridge_profiler_offline.py`
+### 3. Profiler — `lakebridge_profiler_offline.py`
 
 Connects to your source database and captures sizing/usage stats into a **DuckDB file**
 (`profiler_extract_<source>_<version>_<date>.db`) you can feed into the TCO tooling.
@@ -236,7 +224,6 @@ print("reachable")   # no error = the cluster can reach the database
 
 - **Wheelhouse:** `/Volumes/<catalog>/default/lakebridge/wheels`
 - **Analyzer:** input `.../input`, output `.../output` (`report.xlsx` + `report.json`)
-- **Transpiler:** output `.../transpiled`
 - **Reconciler:** results in `<catalog>.lb_recon.{main, metrics, details}`
 - **Profiler:** `.../profiler/profiler_extract_<source>_<version>_<date>.db`
 - **UC connections** (external sources): e.g. `my_redshift_conn`

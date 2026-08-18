@@ -1,6 +1,6 @@
 # Air-gapped in-workspace run (no internet on the cluster)
 
-Run all four Lakebridge tools inside a Databricks workspace whose clusters **have no internet** —
+Run all three Lakebridge tools inside a Databricks workspace whose clusters **have no internet** —
 no Databricks CLI install, no desktop app. Everything is a notebook you import and run.
 
 The only difference from the [`../regular-in-workspace`](../regular-in-workspace) folder is **how
@@ -17,7 +17,6 @@ it top to bottom the first time.
 | Notebook | What it does |
 |---|---|
 | [`lakebridge_analyzer_offline.py`](./lakebridge_analyzer_offline.py)   | **Analyzer** — scans source SQL/ETL files, scores the migration (Excel report) |
-| [`lakebridge_transpile_offline.py`](./lakebridge_transpile_offline.py) | **Transpiler** — rewrites source SQL into Databricks SQL (sqlglot; no Java) |
 | [`lakebridge_reconcile_offline.py`](./lakebridge_reconcile_offline.py) | **Reconciler** — checks a source table and a Databricks table match |
 | [`lakebridge_profiler_offline.py`](./lakebridge_profiler_offline.py)   | **Profiler** — captures source DB sizing/usage into a DuckDB extract (for TCO) |
 
@@ -35,4 +34,4 @@ For each one: **import it → edit the CONFIG cell at the top → Run All** on a
   RUNBOOK's "Connecting to an outside database" section.
 
 > ✅ Verified end-to-end on **Lakebridge 0.15.0**, DBR 17.3, in an air-gapped workspace —
-> Analyzer, Transpiler, Reconciler, and Profiler (against a private Redshift) all pass.
+> Analyzer, Reconciler, and Profiler (against a private Redshift) all pass.
